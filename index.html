@@ -184,6 +184,9 @@
     <div class="status" id="rxStatus">―― 待機中 ――</div>
     <div class="meter"><span id="lvl"></span></div>
 
+    <label class="fld" style="margin-top:12px;">マイク感度（弱い時は上げる）— ×<span id="gainVal">6</span></label>
+    <input type="range" id="gainCtl" min="1" max="20" step="1" value="6">
+
     <div class="canvas-wrap" style="margin-top:14px;">
       <canvas id="rxCanvas" width="32" height="32"></canvas>
     </div>
@@ -191,7 +194,7 @@
     <div class="console" id="con"></div>
 
     <div class="hint">
-      上から一行ずつ <b>ファクスのように</b> 刷り出されます。テープのゆれでたまに飛んでも、行番号で立て直します。<b>送信側と同じマス数</b>で焼いた音を聞かせてください。
+      上から一行ずつ <b>ファクスのように</b> 刷り出されます。受信は<b>マス数自動判別</b>。メーターが振れない時は<b>マイク感度</b>を上げ、送信機に近づけてください。
     </div>
   </div>
 </div>
@@ -408,12 +411,19 @@ $('saveBtn').onclick = ()=>{
    DECODER : マイク → FFT(Goertzel) → ビット → ファクス描画
    =================================================================== */
 let rxRunning=false, rxStream=null;
+let rxGainNode=null;
+
+/* マイク感度スライダー(スタンバイ中もリアルタイム反映) */
+$('gainCtl').oninput = e=>{
+  $('gainVal').textContent = e.target.value;
+  if(rxGainNode) rxGainNode.gain.value = parseFloat(e.target.value);
+};
 
 $('listenBtn').onclick = async ()=>{
   if(rxRunning){ stopRx(); return; }
   $('rxStatus').textContent='マイクを要求中…';
   try{
-    rxStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    rxStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:true}});
   }catch(e){
     $('rxStatus').textContent='⚠ マイク不可: '+e.name;
     log('[RX] getUserMedia 失敗: '+e.name+' — Safariで開いてください','err');
@@ -445,9 +455,11 @@ function startRx(stream){
   log('[RX] sampleRate='+actualSR+' / bit='+spbR+'sample','');
 
   const src = audioCtx.createMediaStreamSource(stream);
+  rxGainNode = audioCtx.createGain();
+  rxGainNode.gain.value = parseFloat($('gainCtl').value) || 6.0;   // ★スライダー連動
   const analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
-  src.connect(analyser);
+  src.connect(rxGainNode); rxGainNode.connect(analyser);
   const tmp = new Float32Array(analyser.fftSize);
 
   // 周波数も実SRに合わせてGoertzel(F0/F1/F_SYNCは固定Hzなのでそのまま)
@@ -501,16 +513,16 @@ function startRx(stream){
     analyser.getFloatTimeDomainData(tmp);
     cbCount++;
     let pk=0; for(let i=0;i<tmp.length;i++){ const a=Math.abs(tmp[i]); if(a>pk)pk=a; }
-    $('lvl').style.width=Math.min(100,pk*180)+'%';
-    if(pk>0.01 && !sawAudio){ sawAudio=true; $('rxStatus').textContent='音を検知 — 復調中'; log('[RX] 音声入力を検知','ok'); }
-    if(cbCount===30 && !sawAudio) log('[RX] まだ音が来ていません(レベル≒0)','warn');
+    $('lvl').style.width=Math.min(100,pk*300)+'%';   // メーターを敏感に
+    if(pk>0.004 && !sawAudio){ sawAudio=true; $('rxStatus').textContent='音を検知 — 復調中'; log('[RX] 音声入力を検知 (lvl='+pk.toFixed(3)+')','ok'); }
+    if(cbCount===60 && !sawAudio) log('[RX] 音が弱い/来ていません — 音量UP・距離を詰めて','warn');
 
     for(let i=0;i<tmp.length;i++) acc.push(tmp[i]);
     while(acc.length>=spbR){
       const chunk=acc.slice(0,spbR); acc=acc.slice(spbR);
       const p0=gz(chunk,F0), p1=gz(chunk,F1), ps=gz(chunk,F_SYNC);
       const mx=Math.max(p0,p1,ps);
-      if(mx<1e-4){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
+      if(mx<2e-3){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
       if(ps===mx){
         if(state==='lead'){ leadCount++; if(leadCount>3){ state='row'; log('[RX] 同期OK. 受信開始','ok'); } }
         else { if(collecting && curBits.length>0) tryCommitRow(); collecting=true; curBits=[]; }
