@@ -327,10 +327,11 @@ function encode(){
   const buf=[]; const ph={p:0};
   // リードトーン（受信側が掴むための助走）
   tone(F_SYNC, LEAD_MS, buf, ph);
-  // ヘッダ行: マジック"AC" + GRID
-  // 各行 = SYNC + rowIndex(8) + GRID画素 + parity(8)
+  // 各行 = SYNC + grid(8) + rowIndex(8) + grid画素 + parity(8)
+  //   gridを毎行埋め込む → 受信側は設定不要で自動判別
   for(let row=0; row<GRID; row++){
     tone(F_SYNC, SYNC_MS, buf, ph);          // 行頭シンク
+    pushByte(GRID, buf, ph);                   // ★グリッドサイズ
     pushByte(row, buf, ph);                    // 行番号
     let parity=0;
     for(let col=0; col<GRID; col++){
@@ -452,10 +453,11 @@ function startRx(stream){
   // 周波数も実SRに合わせてGoertzel(F0/F1/F_SYNCは固定Hzなのでそのまま)
   let acc=[];
   let state='lead'; let leadCount=0;
-  let rowGrid=GRID; let bitsNeeded=8+rowGrid+8;
+  let lockedGrid=0;                 // 0=未確定。最初の正常行で確定
   let curBits=[]; let collecting=false;
   const got = new Set();
   let cbCount=0, sawAudio=false;
+  const MAXBITS = 8+8+32+8;          // grid+row+最大画素+parity ぶん集める
 
   function gz(arr,freq){
     const w=2*Math.PI*freq/actualSR, c=2*Math.cos(w);
@@ -464,20 +466,32 @@ function startRx(stream){
     return s1*s1+s2*s2-c*s1*s2;
   }
   function readByte(a,o){ let v=0; for(let b=0;b<8;b++) v=(v<<1)|a[o+b]; return v; }
+
   function tryCommitRow(){
-    if(curBits.length < bitsNeeded){ collecting=false; curBits=[]; return; }
-    const rowIdx=readByte(curBits,0);
-    const px=curBits.slice(8,8+rowGrid);
-    const parRecv=readByte(curBits,8+rowGrid);
-    let par=0; for(let col=0;col<rowGrid;col++) par^=px[col]<<(col%8);
+    // フォーマット: grid(8) row(8) px(grid) parity(8)
+    if(curBits.length < 8+8+8){ collecting=false; curBits=[]; return; }
+    const g = readByte(curBits,0);                 // 先頭=グリッドサイズ
+    if(g!==16 && g!==24 && g!==32){ collecting=false; curBits=[]; return; } // 異常gridは捨てる
+    const need = 8+8+g+8;
+    if(curBits.length < need){ collecting=false; curBits=[]; return; }
+    const rowIdx = readByte(curBits,8);
+    const px = curBits.slice(16,16+g);
+    const parRecv = readByte(curBits,16+g);
+    let par=0; for(let col=0;col<g;col++) par^=px[col]<<(col%8);
     collecting=false; curBits=[];
-    if(rowIdx>=rowGrid){ return; }
-    if((par&0xff)!==parRecv){ log('[RX] row '+rowIdx+' 化け → 飛ぶ','err'); flashRowGlitch(rowIdx); return; }
+    if(rowIdx>=g){ return; }
+    if((par&0xff)!==parRecv){ log('[RX] row '+rowIdx+' 化け → 飛ぶ','err'); if(lockedGrid) flashRowGlitch(rowIdx); return; }
+    // ここまで来たら正常行。グリッド確定
+    if(!lockedGrid){
+      lockedGrid=g; GRID=g; clearRxCanvas();
+      log('[RX] グリッド自動検出: '+g+'×'+g,'ok');
+    }
+    if(g!==lockedGrid) return;       // 違うgridの行は無視
     if(got.has(rowIdx)) return;
     got.add(rowIdx); drawRow(rowIdx,px);
     log('[RX] row '+String(rowIdx).padStart(2,'0')+' ▒▒ 描画','ok');
-    if(got.size>=rowGrid){
-      $('rxStatus').textContent='★ 受信完了 ★ '+rowGrid+'×'+rowGrid;
+    if(got.size>=lockedGrid){
+      $('rxStatus').textContent='★ 受信完了 ★ '+lockedGrid+'×'+lockedGrid;
       $('rxStatus').classList.remove('live'); finishReveal();
     }
   }
@@ -504,10 +518,8 @@ function startRx(stream){
       }
       if(state==='row'){
         if(!collecting){ collecting=true; curBits=[]; }
-        // マージン判定: 大きい方が小さい方の1.4倍以上ある時だけ確定。僅差は多数決寄せ
-        const bit = p1>p0 ? 1 : 0;
-        curBits.push(bit);
-        if(curBits.length>=bitsNeeded) tryCommitRow();
+        curBits.push(p1>p0 ? 1 : 0);
+        if(curBits.length>=MAXBITS) tryCommitRow();
       }
     }
     rxRAF=requestAnimationFrame(loop);
