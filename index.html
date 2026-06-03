@@ -191,6 +191,8 @@
     <label class="fld" style="margin-top:12px;">マイク感度（弱い時は上げる）— ×<span id="gainVal">6</span></label>
     <input type="range" id="gainCtl" min="1" max="20" step="1" value="6">
 
+    <button class="btn" id="dumpBtn" style="margin-top:10px;border-color:var(--green-dim);color:var(--green-dim);" disabled>🎙 拾った音を💾保存（解析用）</button>
+
     <div class="canvas-wrap" style="margin-top:14px;">
       <canvas id="rxCanvas" width="32" height="32"></canvas>
     </div>
@@ -424,11 +426,22 @@ let rxRunning=false, rxStream=null;
 let rxGainNode=null;
 let rxGot=new Set();
 let rxLockedGrid=0;
+let rxRecord=false, rxRecBuf=[], rxRecSR=48000;
 
 /* マイク感度スライダー(スタンバイ中もリアルタイム反映) */
 $('gainCtl').oninput = e=>{
   $('gainVal').textContent = e.target.value;
   if(rxGainNode) rxGainNode.gain.value = parseFloat(e.target.value);
+};
+
+/* 拾った生音をWAV保存(解析用) */
+$('dumpBtn').onclick = ()=>{
+  if(rxRecBuf.length===0){ alert('まだ音を拾っていません'); return; }
+  const samples=new Float32Array(rxRecBuf);
+  const blob=floatToWav(samples, rxRecSR);
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='rx-captured-'+rxRecSR+'Hz.wav';
+  document.body.appendChild(a); a.click(); a.remove();
 };
 
 /* 手動「今ある分で確定」: 歯抜けでも、揃った行で締める */
@@ -484,6 +497,8 @@ function startRx(stream){
   const actualSR = audioCtx.sampleRate;             // iOSは48000のことが多い
   const spbR = Math.round(actualSR * BIT_MS/1000);   // 実SRに合わせる
   log('[RX] sampleRate='+actualSR+' / bit='+spbR+'sample','');
+  rxRecord=true; rxRecBuf=[]; rxRecSR=actualSR;      // ★解析用に生音録音
+  $('dumpBtn').disabled=false;
 
   const src = audioCtx.createMediaStreamSource(stream);
   rxGainNode = audioCtx.createGain();
@@ -553,6 +568,7 @@ function startRx(stream){
     if(cbCount===60 && !sawAudio) log('[RX] 音が弱い/来ていません — 音量UP・距離を詰めて','warn');
 
     for(let i=0;i<tmp.length;i++) acc.push(tmp[i]);
+    if(rxRecord){ for(let i=0;i<tmp.length;i++) rxRecBuf.push(tmp[i]); }
     // 診断: 同期前の間、1秒おきに各周波数の届き具合を表示
     if(state==='lead' && cbCount%60===0 && acc.length>=spbR){
       const ck=acc.slice(0,spbR);
@@ -594,7 +610,7 @@ function startRx(stream){
 }
 
 function stopRx(){
-  rxRunning=false;
+  rxRunning=false; rxRecord=false;    // 録音停止(バッファは保存用に保持)
   if(rxRAF) cancelAnimationFrame(rxRAF);
   $('listenBtn').textContent='◉ 受信スタンバイ';
   $('rxStatus').classList.remove('live');
