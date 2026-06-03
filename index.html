@@ -209,12 +209,14 @@
    設計: 高橋秀夫 / 配線: Claude
    ======================================================================= */
 
-/* ---------- 信号パラメータ（送受で共有） ---------- */
-const SR        = 44100;          // サンプルレート
-const F0         = 1200;           // bit=0 の周波数 (Hz)
-const F1         = 1800;           // bit=1 の周波数 (Hz)
-const F_SYNC     = 2400;           // 行頭シンクトーン
-const BIT_MS     = 32;             // 1ビットの長さ(ms) ← 長いほどノイズに強い(18→32)
+/* ---------- 信号パラメータ（送受で共有） ----------
+   周波数は「人の声の帯域(300-3400Hz)」を避けて高域に置く。
+   iPhoneマイクの音声最適化(ノイズ抑制/エコー消し)に消されにくくするため。 */
+const SR        = 44100;          // サンプルレート(WAV保存用の名目値)
+const F0         = 3200;           // bit=0 の周波数 (Hz)
+const F1         = 4000;           // bit=1 の周波数 (Hz)
+const F_SYNC     = 4800;           // 行頭シンクトーン (Hz)
+const BIT_MS     = 32;             // 1ビットの長さ(ms) ← 長いほどノイズに強い
 const LEAD_MS    = 600;            // 先頭リードトーン(F_SYNC)
 const ROW_GAP_MS = 30;             // 行間の無音
 const SYNC_MS    = 40;             // 各行頭シンク長
@@ -314,86 +316,88 @@ function renderBW(){
 
 /* ===================================================================
    ENCODER  : bwBits → FSK 音声(Float32) → WAV
+   SRは引数で受ける(送信再生時の実サンプルレートに合わせるため)
    =================================================================== */
-function tone(freq, ms, buf, phaseRef){
-  const n = Math.round(SR*ms/1000);
+function tone(freq, ms, buf, phaseRef, sr){
+  const n = Math.round(sr*ms/1000);
   for(let i=0;i<n;i++){
-    phaseRef.p += 2*Math.PI*freq/SR;
+    phaseRef.p += 2*Math.PI*freq/sr;
     buf.push(Math.sin(phaseRef.p)*0.6);
   }
 }
-function bitTone(bit, buf, phaseRef){
-  tone(bit? F1 : F0, BIT_MS, buf, phaseRef);
+function bitTone(bit, buf, phaseRef, sr){
+  tone(bit? F1 : F0, BIT_MS, buf, phaseRef, sr);
 }
-function pushByte(val, buf, phaseRef){
-  for(let b=7;b>=0;b--) bitTone((val>>b)&1, buf, phaseRef);
+function pushByte(val, buf, phaseRef, sr){
+  for(let b=7;b>=0;b--) bitTone((val>>b)&1, buf, phaseRef, sr);
 }
 
-function encode(){
+function encode(sr){
   if(!bwBits){return;}
   const buf=[]; const ph={p:0};
-  // リードトーン（受信側が掴むための助走）
-  tone(F_SYNC, LEAD_MS, buf, ph);
-  // 各行 = SYNC + grid(8) + rowIndex(8) + grid画素 + parity(8)
-  //   gridを毎行埋め込む → 受信側は設定不要で自動判別
+  tone(F_SYNC, LEAD_MS, buf, ph, sr);
   for(let row=0; row<GRID; row++){
-    tone(F_SYNC, SYNC_MS, buf, ph);          // 行頭シンク
-    pushByte(GRID, buf, ph);                   // ★グリッドサイズ
-    pushByte(row, buf, ph);                    // 行番号
+    tone(F_SYNC, SYNC_MS, buf, ph, sr);
+    pushByte(GRID, buf, ph, sr);
+    pushByte(row, buf, ph, sr);
     let parity=0;
     for(let col=0; col<GRID; col++){
       const bit=bwBits[row*GRID+col];
-      bitTone(bit, buf, ph);
+      bitTone(bit, buf, ph, sr);
       parity ^= bit<<(col%8);
     }
-    pushByte(parity & 0xff, buf, ph);          // パリティ
-    // 行間無音
-    const gap=Math.round(SR*ROW_GAP_MS/1000);
+    pushByte(parity & 0xff, buf, ph, sr);
+    const gap=Math.round(sr*ROW_GAP_MS/1000);
     for(let i=0;i<gap;i++) buf.push(0);
   }
-  // 終端: F_SYNCを長め＋F1を交互に → 「明確な終わりの合図」
-  tone(F_SYNC, 400, buf, ph);
-  for(let k=0;k<6;k++){ tone(F1, 60, buf, ph); tone(F_SYNC, 60, buf, ph); }
-  tone(F_SYNC, 400, buf, ph);
+  // 最終行を確実にコミットさせるため、終端前に長めの無音
+  { const g2=Math.round(sr*120/1000); for(let i=0;i<g2;i++) buf.push(0); }
+  tone(F_SYNC, 400, buf, ph, sr);
+  for(let k=0;k<6;k++){ tone(F1, 60, buf, ph, sr); tone(F_SYNC, 60, buf, ph, sr); }
+  tone(F_SYNC, 400, buf, ph, sr);
   return new Float32Array(buf);
 }
 
-function floatToWav(samples){
+function floatToWav(samples, sr){
   const len=samples.length;
   const ab=new ArrayBuffer(44+len*2); const dv=new DataView(ab);
   const ws=(o,s)=>{for(let i=0;i<s.length;i++)dv.setUint8(o+i,s.charCodeAt(i));};
   ws(0,'RIFF'); dv.setUint32(4,36+len*2,true); ws(8,'WAVE'); ws(12,'fmt ');
   dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
-  dv.setUint32(24,SR,true); dv.setUint32(28,SR*2,true); dv.setUint16(32,2,true);
+  dv.setUint32(24,sr,true); dv.setUint32(28,sr*2,true); dv.setUint16(32,2,true);
   dv.setUint16(34,16,true); ws(36,'data'); dv.setUint32(40,len*2,true);
   let o=44; for(let i=0;i<len;i++){ let s=Math.max(-1,Math.min(1,samples[i])); dv.setInt16(o,s<0?s*0x8000:s*0x7fff,true); o+=2; }
   return new Blob([ab],{type:'audio/wav'});
 }
 
 let encodedSamples=null;        // 生成済みFloat32(再生用にメモリ保持)
+let encodedSR=SR;               // 生成に使った実SR
 let txCtx=null, txSource=null;
 
 $('encBtn').onclick = ()=>{
   const reels=[$('reelL'),$('reelR')]; reels.forEach(r=>r.classList.add('spin'));
   setTimeout(()=>{
-    encodedSamples=encode();
-    encodedWav=floatToWav(encodedSamples);
+    // 再生に使うコンテキストを先に作り、その実SRで生成する（送受信のピッチ一致の要）
+    if(!txCtx) txCtx=new (window.AudioContext||window.webkitAudioContext)();
+    encodedSR = txCtx.sampleRate;
+    encodedSamples=encode(encodedSR);
+    encodedWav=floatToWav(encodedSamples, encodedSR);
     $('playBtn').disabled=false; $('saveBtn').disabled=false;
     reels.forEach(r=>r.classList.remove('spin'));
-    const secs=(encodedSamples.length/SR).toFixed(1);
-    $('encBtn').textContent='🔊 再生成する（'+GRID+'×'+GRID+' / '+secs+'秒）';
+    const secs=(encodedSamples.length/encodedSR).toFixed(1);
+    $('encBtn').textContent='🔊 再生成する（'+GRID+'×'+GRID+' / '+secs+'秒 / '+encodedSR+'Hz）';
   },300);
 };
 
-/* iOS対応: audioタグを使わず Web Audio で直接鳴らす */
+/* iOS対応: audioタグを使わず Web Audio で直接鳴らす(生成時と同じctx/SR) */
 $('playBtn').onclick = ()=>{
   if(!encodedSamples) return;
   if(txSource){ try{txSource.stop();}catch(e){} txSource=null;
     $('playBtn').textContent='▶ 再生';
     $('reelL').classList.remove('spin'); $('reelR').classList.remove('spin'); return; }
-  if(!txCtx) txCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  if(txCtx.state==='suspended') txCtx.resume();      // iOSはユーザー操作で起こす
-  const buf=txCtx.createBuffer(1, encodedSamples.length, SR);
+  if(!txCtx) txCtx=new (window.AudioContext||window.webkitAudioContext)();
+  if(txCtx.state==='suspended') txCtx.resume();
+  const buf=txCtx.createBuffer(1, encodedSamples.length, txCtx.sampleRate);
   buf.getChannelData(0).set(encodedSamples);
   txSource=txCtx.createBufferSource();
   txSource.buffer=buf; txSource.connect(txCtx.destination);
@@ -446,7 +450,11 @@ $('listenBtn').onclick = async ()=>{
   if(rxRunning){ stopRx(); return; }
   $('rxStatus').textContent='マイクを要求中…';
   try{
-    rxStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:true}});
+    rxStream = await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:false, noiseSuppression:false, autoGainControl:false,
+      googEchoCancellation:false, googNoiseSuppression:false, googAutoGainControl:false,
+      googHighpassFilter:false, googTypingNoiseDetection:false
+    }});
   }catch(e){
     $('rxStatus').textContent='⚠ マイク不可: '+e.name;
     log('[RX] getUserMedia 失敗: '+e.name+' — Safariで開いてください','err');
@@ -545,6 +553,12 @@ function startRx(stream){
     if(cbCount===60 && !sawAudio) log('[RX] 音が弱い/来ていません — 音量UP・距離を詰めて','warn');
 
     for(let i=0;i<tmp.length;i++) acc.push(tmp[i]);
+    // 診断: 同期前の間、1秒おきに各周波数の届き具合を表示
+    if(state==='lead' && cbCount%60===0 && acc.length>=spbR){
+      const ck=acc.slice(0,spbR);
+      const d0=gz(ck,F0),d1=gz(ck,F1),ds=gz(ck,F_SYNC);
+      log('[診断] F0='+d0.toFixed(3)+' F1='+d1.toFixed(3)+' SYNC='+ds.toFixed(3),'');
+    }
     while(acc.length>=spbR){
       const chunk=acc.slice(0,spbR); acc=acc.slice(spbR);
       const p0=gz(chunk,F0), p1=gz(chunk,F1), ps=gz(chunk,F_SYNC);
@@ -558,7 +572,9 @@ function startRx(stream){
       if(state==='row'){
         if(!collecting){ collecting=true; curBits=[]; }
         curBits.push(p1>p0 ? 1 : 0);
-        if(curBits.length>=MAXBITS) tryCommitRow();
+        // グリッド確定後はその行長ちょうどで即コミット(最終行も次を待たない)
+        const target = rxLockedGrid ? (8+8+rxLockedGrid+8) : MAXBITS;
+        if(curBits.length>=target) tryCommitRow();
       }
     }
     rxRAF=requestAnimationFrame(loop);
