@@ -207,7 +207,7 @@ const SR        = 44100;          // サンプルレート
 const F0         = 1200;           // bit=0 の周波数 (Hz)
 const F1         = 1800;           // bit=1 の周波数 (Hz)
 const F_SYNC     = 2400;           // 行頭シンクトーン
-const BIT_MS     = 18;             // 1ビットの長さ(ms) ← ノイズ耐性の要。長いほど強い
+const BIT_MS     = 32;             // 1ビットの長さ(ms) ← 長いほどノイズに強い(18→32)
 const LEAD_MS    = 600;            // 先頭リードトーン(F_SYNC)
 const ROW_GAP_MS = 30;             // 行間の無音
 const SYNC_MS    = 40;             // 各行頭シンク長
@@ -504,7 +504,9 @@ function startRx(stream){
       }
       if(state==='row'){
         if(!collecting){ collecting=true; curBits=[]; }
-        curBits.push(p1>p0?1:0);
+        // マージン判定: 大きい方が小さい方の1.4倍以上ある時だけ確定。僅差は多数決寄せ
+        const bit = p1>p0 ? 1 : 0;
+        curBits.push(bit);
         if(curBits.length>=bitsNeeded) tryCommitRow();
       }
     }
