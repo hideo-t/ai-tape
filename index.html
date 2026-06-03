@@ -567,7 +567,7 @@ function startRx(stream){
       const sum=p0+p1+ps+1e-12;
       // 無音判定: 絶対値ではなく「最大が全体に占める割合」で見る(マイクの弱信号対応)
       // さらに、入力レベル自体が極小(本当の無音)も拾う
-      if(pk<0.0015 || mx/sum < 0.45){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
+      if(pk<0.0015 || mx/sum < 0.40){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
       if(ps===mx){
         if(state==='lead'){ leadCount++; if(leadCount>3){ state='row'; log('[RX] 同期OK. 受信開始','ok'); } }
         else { if(collecting && curBits.length>0) tryCommitRow(); collecting=true; curBits=[]; }
@@ -575,8 +575,15 @@ function startRx(stream){
       }
       if(state==='row'){
         if(!collecting){ collecting=true; curBits=[]; }
-        curBits.push(p1>p0 ? 1 : 0);
-        // グリッド確定後はその行長ちょうどで即コミット(最終行も次を待たない)
+        // ★1ビット区間を3分割して多数決(完全一致は狙わず、優勢な方を採る)
+        const third = Math.floor(spbR/3);
+        let votes=0;
+        for(let s=0;s<3;s++){
+          const sub = chunk.slice(s*third, (s+1)*third);
+          const q0=gz(sub,F0), q1=gz(sub,F1);
+          if(q1>q0) votes++;   // F1寄り=1票
+        }
+        curBits.push(votes>=2 ? 1 : 0);   // 3回中2回以上が1なら1
         const target = rxLockedGrid ? (8+8+rxLockedGrid+8) : MAXBITS;
         if(curBits.length>=target) tryCommitRow();
       }
