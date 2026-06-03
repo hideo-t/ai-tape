@@ -427,6 +427,7 @@ let rxGainNode=null;
 let rxGot=new Set();
 let rxLockedGrid=0;
 let rxRecord=false, rxRecBuf=[], rxRecSR=48000;
+let rxWorkletNode=null;
 
 /* マイク感度スライダー(スタンバイ中もリアルタイム反映) */
 $('gainCtl').oninput = e=>{
@@ -453,8 +454,8 @@ $('finalizeBtn').onclick = ()=>{
   log('[RX] 手動確定: '+n+'/'+total+' 行で締め','warn');
   finishReveal();
   $('finalizeBtn').disabled=true;
-  rxRunning=false;
-  if(rxRAF) cancelAnimationFrame(rxRAF);
+  rxRunning=false; rxRecord=false;
+  if(rxWorkletNode){ try{rxWorkletNode.port.onmessage=null; rxWorkletNode.disconnect();}catch(e){} rxWorkletNode=null; }
   if(rxStream){ rxStream.getTracks().forEach(t=>t.stop()); rxStream=null; }
   $('listenBtn').textContent='◉ 受信スタンバイ';
 };
@@ -483,7 +484,6 @@ function goertzel(samples, freq){
   return s1*s1+s2*s2-c*s1*s2;
 }
 
-let rxRAF=null;
 function startRx(stream){
   rxRunning=true;
   $('listenBtn').textContent='■ 停止';
@@ -502,20 +502,17 @@ function startRx(stream){
 
   const src = audioCtx.createMediaStreamSource(stream);
   rxGainNode = audioCtx.createGain();
-  rxGainNode.gain.value = parseFloat($('gainCtl').value) || 6.0;   // ★スライダー連動
-  const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 2048;
-  src.connect(rxGainNode); rxGainNode.connect(analyser);
-  const tmp = new Float32Array(analyser.fftSize);
+  rxGainNode.gain.value = parseFloat($('gainCtl').value) || 6.0;
 
-  // 周波数も実SRに合わせてGoertzel(F0/F1/F_SYNCは固定Hzなのでそのまま)
+  // 周波数も実SRに合わせてGoertzel
   let acc=[];
   let state='lead'; let leadCount=0;
-  rxLockedGrid=0;                   // 0=未確定。最初の正常行で確定(モジュール変数)
+  rxLockedGrid=0;
   rxGot=new Set();
   let curBits=[]; let collecting=false;
   let cbCount=0, sawAudio=false;
-  const MAXBITS = 8+8+32+8;          // grid+row+最大画素+parity ぶん集める
+  let curPk=0;
+  const MAXBITS = 8+8+32+8;
   $('finalizeBtn').disabled=false;
   $('rxProgress').textContent='受信 0 行';
 
@@ -528,10 +525,9 @@ function startRx(stream){
   function readByte(a,o){ let v=0; for(let b=0;b<8;b++) v=(v<<1)|a[o+b]; return v; }
 
   function tryCommitRow(){
-    // フォーマット: grid(8) row(8) px(grid) parity(8)
     if(curBits.length < 8+8+8){ collecting=false; curBits=[]; return; }
-    const g = readByte(curBits,0);                 // 先頭=グリッドサイズ
-    if(g!==16 && g!==24 && g!==32){ collecting=false; curBits=[]; return; } // 異常gridは捨てる
+    const g = readByte(curBits,0);
+    if(g!==16 && g!==24 && g!==32){ collecting=false; curBits=[]; return; }
     const need = 8+8+g+8;
     if(curBits.length < need){ collecting=false; curBits=[]; return; }
     const rowIdx = readByte(curBits,8);
@@ -541,12 +537,8 @@ function startRx(stream){
     collecting=false; curBits=[];
     if(rowIdx>=g){ return; }
     if((par&0xff)!==parRecv){ log('[RX] row '+rowIdx+' 化け → 飛ぶ','err'); if(rxLockedGrid) flashRowGlitch(rowIdx); return; }
-    // ここまで来たら正常行。グリッド確定
-    if(!rxLockedGrid){
-      rxLockedGrid=g; GRID=g; clearRxCanvas();
-      log('[RX] グリッド自動検出: '+g+'×'+g,'ok');
-    }
-    if(g!==rxLockedGrid) return;       // 違うgridの行は無視
+    if(!rxLockedGrid){ rxLockedGrid=g; GRID=g; clearRxCanvas(); log('[RX] グリッド自動検出: '+g+'×'+g,'ok'); }
+    if(g!==rxLockedGrid) return;
     if(rxGot.has(rowIdx)) return;
     rxGot.add(rowIdx); drawRow(rowIdx,px);
     $('rxProgress').textContent='受信 '+rxGot.size+' / '+rxLockedGrid+' 行';
@@ -558,32 +550,34 @@ function startRx(stream){
     }
   }
 
-  function loop(){
+  // ★連続サンプルを1ビット分ずつ処理(重複なし)
+  function processSamples(samples){
     if(!rxRunning) return;
-    analyser.getFloatTimeDomainData(tmp);
-    cbCount++;
-    let pk=0; for(let i=0;i<tmp.length;i++){ const a=Math.abs(tmp[i]); if(a>pk)pk=a; }
-    $('lvl').style.width=Math.min(100,pk*300)+'%';   // メーターを敏感に
+    // レベルメーター＆録音
+    let pk=0; for(let i=0;i<samples.length;i++){ const a=Math.abs(samples[i]); if(a>pk)pk=a; }
+    curPk=pk;
+    $('lvl').style.width=Math.min(100,pk*300)+'%';
     if(pk>0.004 && !sawAudio){ sawAudio=true; $('rxStatus').textContent='音を検知 — 復調中'; log('[RX] 音声入力を検知 (lvl='+pk.toFixed(3)+')','ok'); }
-    if(cbCount===60 && !sawAudio) log('[RX] 音が弱い/来ていません — 音量UP・距離を詰めて','warn');
+    cbCount++;
+    if(cbCount===100 && !sawAudio) log('[RX] 音が弱い/来ていません — 音量UP・距離を詰めて','warn');
 
-    for(let i=0;i<tmp.length;i++) acc.push(tmp[i]);
-    if(rxRecord){ for(let i=0;i<tmp.length;i++) rxRecBuf.push(tmp[i]); }
-    // 診断: 同期前の間、1秒おきに各周波数の届き具合を表示
-    if(state==='lead' && cbCount%60===0 && acc.length>=spbR){
+    for(let i=0;i<samples.length;i++) acc.push(samples[i]);
+    if(rxRecord){ for(let i=0;i<samples.length;i++) rxRecBuf.push(samples[i]); }
+
+    if(state==='lead' && cbCount%40===0 && acc.length>=spbR){
       const ck=acc.slice(0,spbR);
       const d0=gz(ck,F0),d1=gz(ck,F1),ds=gz(ck,F_SYNC);
-      const sm=d0+d1+ds+1e-12; const mxd=Math.max(d0,d1,ds);
-      log('[診断] lvl='+pk.toFixed(3)+' SYNC比='+(ds/sm).toFixed(2)+' (1に近いほど良)','');
+      const sm=d0+d1+ds+1e-12;
+      log('[診断] lvl='+pk.toFixed(3)+' SYNC比='+(ds/sm).toFixed(2),'');
     }
+
     while(acc.length>=spbR){
       const chunk=acc.slice(0,spbR); acc=acc.slice(spbR);
       const p0=gz(chunk,F0), p1=gz(chunk,F1), ps=gz(chunk,F_SYNC);
       const mx=Math.max(p0,p1,ps);
       const sum=p0+p1+ps+1e-12;
-      // 無音判定: 絶対値ではなく「最大が全体に占める割合」で見る(マイクの弱信号対応)
-      // さらに、入力レベル自体が極小(本当の無音)も拾う
-      if(pk<0.0015 || mx/sum < 0.40){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
+      let cpk=0; for(let i=0;i<chunk.length;i++){const a=Math.abs(chunk[i]);if(a>cpk)cpk=a;}
+      if(cpk<0.0015 || mx/sum < 0.40){ if(collecting && curBits.length>0) tryCommitRow(); continue; }
       if(ps===mx){
         if(state==='lead'){ leadCount++; if(leadCount>3){ state='row'; log('[RX] 同期OK. 受信開始','ok'); } }
         else { if(collecting && curBits.length>0) tryCommitRow(); collecting=true; curBits=[]; }
@@ -591,27 +585,52 @@ function startRx(stream){
       }
       if(state==='row'){
         if(!collecting){ collecting=true; curBits=[]; }
-        // ★1ビット区間を3分割して多数決(完全一致は狙わず、優勢な方を採る)
         const third = Math.floor(spbR/3);
         let votes=0;
         for(let s=0;s<3;s++){
           const sub = chunk.slice(s*third, (s+1)*third);
           const q0=gz(sub,F0), q1=gz(sub,F1);
-          if(q1>q0) votes++;   // F1寄り=1票
+          if(q1>q0) votes++;
         }
-        curBits.push(votes>=2 ? 1 : 0);   // 3回中2回以上が1なら1
+        curBits.push(votes>=2 ? 1 : 0);
         const target = rxLockedGrid ? (8+8+rxLockedGrid+8) : MAXBITS;
         if(curBits.length>=target) tryCommitRow();
       }
     }
-    rxRAF=requestAnimationFrame(loop);
   }
-  rxRAF=requestAnimationFrame(loop);
+
+  // AudioWorklet: 途切れない連続サンプルを供給(重複・歯抜けなし)
+  const workletCode = `
+    class CapProc extends AudioWorkletProcessor {
+      process(inputs){
+        const ch = inputs[0][0];
+        if(ch && ch.length){ this.port.postMessage(ch.slice(0)); }
+        return true;
+      }
+    }
+    registerProcessor('cap-proc', CapProc);
+  `;
+  const blob = new Blob([workletCode], {type:'application/javascript'});
+  const url = URL.createObjectURL(blob);
+
+  audioCtx.audioWorklet.addModule(url).then(()=>{
+    const node = new AudioWorkletNode(audioCtx, 'cap-proc');
+    node.port.onmessage = ev=>{ processSamples(ev.data); };
+    src.connect(rxGainNode); rxGainNode.connect(node);
+    // Workletは出力を持たないので destination 接続は不要だが、念のため無音接続でグラフを生かす
+    const mute = audioCtx.createGain(); mute.gain.value=0;
+    node.connect(mute); mute.connect(audioCtx.destination);
+    rxWorkletNode = node;
+    log('[RX] Worklet起動 — 連続サンプル受信中','ok');
+  }).catch(e=>{
+    log('[RX] Worklet失敗: '+e.message+' — Safari最新版で開いて','err');
+    $('rxStatus').textContent='⚠ Worklet非対応';
+  });
 }
 
 function stopRx(){
-  rxRunning=false; rxRecord=false;    // 録音停止(バッファは保存用に保持)
-  if(rxRAF) cancelAnimationFrame(rxRAF);
+  rxRunning=false; rxRecord=false;
+  if(rxWorkletNode){ try{rxWorkletNode.port.onmessage=null; rxWorkletNode.disconnect();}catch(e){} rxWorkletNode=null; }
   $('listenBtn').textContent='◉ 受信スタンバイ';
   $('rxStatus').classList.remove('live');
   if(rxStream){ rxStream.getTracks().forEach(t=>t.stop()); rxStream=null; }
