@@ -183,6 +183,10 @@
     <button class="btn rec" id="listenBtn">◉ 受信スタンバイ</button>
     <div class="status" id="rxStatus">―― 待機中 ――</div>
     <div class="meter"><span id="lvl"></span></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:12px;color:var(--amber);letter-spacing:1px;">
+      <span id="rxProgress">受信 0 行</span>
+      <button class="btn" id="finalizeBtn" style="width:auto;margin:0;padding:7px 14px;font-size:12px;" disabled>■ 今ある分で確定</button>
+    </div>
 
     <label class="fld" style="margin-top:12px;">マイク感度（弱い時は上げる）— ×<span id="gainVal">6</span></label>
     <input type="range" id="gainCtl" min="1" max="20" step="1" value="6">
@@ -347,8 +351,10 @@ function encode(){
     const gap=Math.round(SR*ROW_GAP_MS/1000);
     for(let i=0;i<gap;i++) buf.push(0);
   }
-  // 終端
-  tone(F_SYNC, 200, buf, ph);
+  // 終端: F_SYNCを長め＋F1を交互に → 「明確な終わりの合図」
+  tone(F_SYNC, 400, buf, ph);
+  for(let k=0;k<6;k++){ tone(F1, 60, buf, ph); tone(F_SYNC, 60, buf, ph); }
+  tone(F_SYNC, 400, buf, ph);
   return new Float32Array(buf);
 }
 
@@ -412,11 +418,28 @@ $('saveBtn').onclick = ()=>{
    =================================================================== */
 let rxRunning=false, rxStream=null;
 let rxGainNode=null;
+let rxGot=new Set();
+let rxLockedGrid=0;
 
 /* マイク感度スライダー(スタンバイ中もリアルタイム反映) */
 $('gainCtl').oninput = e=>{
   $('gainVal').textContent = e.target.value;
   if(rxGainNode) rxGainNode.gain.value = parseFloat(e.target.value);
+};
+
+/* 手動「今ある分で確定」: 歯抜けでも、揃った行で締める */
+$('finalizeBtn').onclick = ()=>{
+  const total = rxLockedGrid || GRID;
+  const n = rxGot.size;
+  $('rxStatus').textContent = '■ 手動確定 — '+n+' / '+total+' 行';
+  $('rxStatus').classList.remove('live');
+  log('[RX] 手動確定: '+n+'/'+total+' 行で締め','warn');
+  finishReveal();
+  $('finalizeBtn').disabled=true;
+  rxRunning=false;
+  if(rxRAF) cancelAnimationFrame(rxRAF);
+  if(rxStream){ rxStream.getTracks().forEach(t=>t.stop()); rxStream=null; }
+  $('listenBtn').textContent='◉ 受信スタンバイ';
 };
 
 $('listenBtn').onclick = async ()=>{
@@ -465,11 +488,13 @@ function startRx(stream){
   // 周波数も実SRに合わせてGoertzel(F0/F1/F_SYNCは固定Hzなのでそのまま)
   let acc=[];
   let state='lead'; let leadCount=0;
-  let lockedGrid=0;                 // 0=未確定。最初の正常行で確定
+  rxLockedGrid=0;                   // 0=未確定。最初の正常行で確定(モジュール変数)
+  rxGot=new Set();
   let curBits=[]; let collecting=false;
-  const got = new Set();
   let cbCount=0, sawAudio=false;
   const MAXBITS = 8+8+32+8;          // grid+row+最大画素+parity ぶん集める
+  $('finalizeBtn').disabled=false;
+  $('rxProgress').textContent='受信 0 行';
 
   function gz(arr,freq){
     const w=2*Math.PI*freq/actualSR, c=2*Math.cos(w);
@@ -492,19 +517,21 @@ function startRx(stream){
     let par=0; for(let col=0;col<g;col++) par^=px[col]<<(col%8);
     collecting=false; curBits=[];
     if(rowIdx>=g){ return; }
-    if((par&0xff)!==parRecv){ log('[RX] row '+rowIdx+' 化け → 飛ぶ','err'); if(lockedGrid) flashRowGlitch(rowIdx); return; }
+    if((par&0xff)!==parRecv){ log('[RX] row '+rowIdx+' 化け → 飛ぶ','err'); if(rxLockedGrid) flashRowGlitch(rowIdx); return; }
     // ここまで来たら正常行。グリッド確定
-    if(!lockedGrid){
-      lockedGrid=g; GRID=g; clearRxCanvas();
+    if(!rxLockedGrid){
+      rxLockedGrid=g; GRID=g; clearRxCanvas();
       log('[RX] グリッド自動検出: '+g+'×'+g,'ok');
     }
-    if(g!==lockedGrid) return;       // 違うgridの行は無視
-    if(got.has(rowIdx)) return;
-    got.add(rowIdx); drawRow(rowIdx,px);
+    if(g!==rxLockedGrid) return;       // 違うgridの行は無視
+    if(rxGot.has(rowIdx)) return;
+    rxGot.add(rowIdx); drawRow(rowIdx,px);
+    $('rxProgress').textContent='受信 '+rxGot.size+' / '+rxLockedGrid+' 行';
     log('[RX] row '+String(rowIdx).padStart(2,'0')+' ▒▒ 描画','ok');
-    if(got.size>=lockedGrid){
-      $('rxStatus').textContent='★ 受信完了 ★ '+lockedGrid+'×'+lockedGrid;
+    if(rxGot.size>=rxLockedGrid){
+      $('rxStatus').textContent='★ 受信完了 ★ '+rxLockedGrid+'×'+rxLockedGrid;
       $('rxStatus').classList.remove('live'); finishReveal();
+      $('finalizeBtn').disabled=true;
     }
   }
 
